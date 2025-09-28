@@ -13,7 +13,7 @@ from fall_logic import FallDetectorLogic
 
 def main():
     # 파일 경로 설정
-    video_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'videos', '01.mp4')
+    video_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'videos', '03.mp4')
     
     yolo_detector = YoloDetector()
     pose_estimator = PoseEstimator()
