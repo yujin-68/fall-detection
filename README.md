@@ -1,11 +1,11 @@
-# 규칙 기반 낙상 감지 알고리즘 (Fall Detection System)
+# 베이즈 추론 기반 낙상 감지 알고리즘 (Fall Detection System)
 
 [![Language: Python](https://img.shields.io/badge/Language-Python-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## 💡 프로젝트 개요 및 배경
 
-본 프로젝트는 **YOLOv8** 객체 감지 모델과 **MediaPipe Pose**를 결합하여 노인 및 환자의 낙상 사고를 실시간으로 감지하는 고신뢰성 시스템입니다.
+본 프로젝트는 **YOLOv8** 객체 감지 모델과 **MediaPipe Pose**를 결합하고, 바운딩 박스 특징에 대해 **베이즈 추론(로그-오즈 누적)** 을 적용하여 낙상 사고를 실시간으로 감지하는 시스템입니다.
 
 ### 문제 해결: 원근 문제와 오탐지 방지
 
@@ -24,7 +24,7 @@
 | :----- | :----- | :----- |
 | **객체 감지 (BBox)** | `ultralytics` (YOLOv8n) | 사람 객체 감지 및 추적 |
 | **자세 추정 (Pose)** | `mediapipe` | 인체 랜드마크(관절 좌표) 추정 및 시각화 (보조 역할) |
-| **핵심 로직** | Python (규칙 기반 FSM) | Y축 속도, 비율, **정지 시간**을 이용한 최종 사고 확정 |
+| **핵심 로직** | Python (Bayesian + FSM) | 속도/비율/정지 여부의 **우도 누적(Posterior)** 로 사고 확정 |
 | **실행 환경** | `opencv-python (cv2)` | 비디오 스트림 처리 및 실시간 결과 시각화 |
 
 ### 2. 모듈 구조 (`src/` 폴더)
@@ -38,40 +38,40 @@
 
 ---
 
-## 🧠 핵심 로직: Stillness Tracking 상세
+## 🧠 핵심 로직: 베이즈 추론 + 히스테리시스
 
-알고리즘은 5가지 상태(`Standing`, `Sitting`, `Lying`, `Potential Fall`, `Fall Detected!`)를 정의하며, 오탐지 방지를 위해 **3초간의 정지 시간**을 필수 조건으로 사용합니다.
+알고리즘은 5가지 상태(`Standing`, `Sitting`, `Lying`, `Potential Fall`, `Fall Detected!`)를 유지하면서, 각 프레임의 **증거(feature)** 로부터 `P(Fall)`을 업데이트합니다. 의사결정은 확률 임계값 기반으로 이뤄지며, **히스테리시스**로 떨림을 완화합니다.
 
-### 1. 주요 판단 지표 임계값
+### 1. 사용 특징과 우도(LLR)
 
-| 지표 | 값 | 역할 |
-| :----- | :----- | :----- |
-| Velocity_Y | $\mathbf{150} \text{ 픽셀/초}$ | 중심점의 급격한 하강 감지 (1차 경보) |
-| $\Delta x / \Delta y$ | $\mathbf{1.0}$ | 바운딩 박스 종횡비; 누운 자세(`Lying`) 판별 |
-| STILLNESS_TIME | $\mathbf{3}$ 초 | 사고 확정을 위한 최소 정지 시간 |
-| STILLNESS_Y | $\mathbf{5}$ 픽셀 | 정지 상태로 간주할 Y축 중심점 변화 최대치 |
+- **Velocity_Y**: 바운딩 박스 중심의 Y축 속도. 가우시안 근사 우도.
+- **Aspect Ratio**: 바운딩 박스 가로/세로 비. 가우시안 근사 우도.
+- **Stillness**: 프레임 간 Y 변화량이 임계값 미만인지. 베르누이 우도.
 
-### 2. 다단계 상태 전환 메커니즘
+각 특징은 `LLR = log p(f|Fall) - log p(f|¬Fall)`로 변환되어 프레임마다 누적됩니다.
 
-| 상태 | 설명 | 전환 조건 |
-| :----- | :----- | :----- |
-| `Standing` | 정상 상태 | - |
-| `Potential Fall` | 낙상 가능성 (1차 경보) | Velocity_Y 임계값 초과 시 **타이머 시작** |
-| **`Fall Detected!`** | **최종 사고 확정** | **`Potential Fall` & 누운 자세 & 3초 이상 정지 상태 유지** |
-| `Lying` | 단순히 누워있는 자세 | (낙상 속도 없이 비율만 충족) |
+### 2. 핵심 파라미터(기본값)
+
+- Prior: `P(Fall) ≈ 1%` → `DEFAULT_LOG_ODDS`
+- Transition bias: `TRANSITION_BIAS ≈ log(1.02)` (연속성 미세 가중)
+- 결정 임계값: `FALL_THRESHOLD = 0.9`, 복구 임계값: `RECOVER_THRESHOLD = 0.7`
+- 정지판정: `STILLNESS_Y_THRESHOLD = 5` 픽셀
+- 가우시안 근사 평균/분산: 속도(`VEL_*`), 비율(`AR_*`)은 데이터로 튜닝
+
+### 3. 상태 결정 로직(요지)
+
+- `p_fall = sigmoid(DEFAULT_LOG_ODDS + Σ LLR + TRANSITION_BIAS)`
+- `p_fall ≥ 0.9` 이면 `Fall Detected!` 확정(유지)
+- `p_fall < 0.7`이면 복구하여 `Lying/Standing` 등으로 전환
+- 그 외에는 보조 상태(`Lying/Sitting/Potential Fall/Standing`)를 규칙으로 라벨링
 
 ---
 
-## 📊 테스트 결과 (Stillness Logic 검증 성공)
+## 📊 기대 효과
 
-테스트 결과, 알고리즘은 **3초의 고정된 지연 시간**을 거쳐 낙상 사고를 성공적으로 확정했습니다. 이는 단순 누움 상태와 실제 긴급 상황을 명확히 구분했음을 의미합니다.
-
-| 프레임 | 상태 | 설명 |
-| :----- | :----- | :----- |
-| **0 ~ 70** | `Standing` | 초기 정상 상태 |
-| **70** | `Potential Fall` | 급격한 움직임 감지, **타이머 시작** |
-| **70 ~ 130** | `Potential Fall` | **3초 (약 60프레임)** 동안 정지 상태 유지 확인 |
-| **130 이후** | **`Fall Detected!`** | 정지 시간(3초) 초과 후, 최종 사고 확정 |
+- 프레임 노이즈/누락에 강한 **시간적 일관성**
+- 임계값 기반 규칙 대비 **오탐/미탐 균형 조절 용이** (튜닝으로 조정)
+- 히스테리시스로 상태 **깜빡임 감소**
 
 ---
 
@@ -95,3 +95,8 @@ pip install ultralytics mediapipe opencv-python numpy
 ```bash
 python src/main.py
 ```
+
+### 3. 파라미터 튜닝 가이드
+
+- 카메라 해상도/프레임레이트에 따라 `VEL_*`, `AR_*`, `STILL_P_*`, `FALL_THRESHOLD`, `RECOVER_THRESHOLD`, `TRANSITION_BIAS`를 조정하세요.
+- 다인 장면에서는 추적기(예: DeepSORT, ByteTrack)로 `track_id`를 안정적으로 유지하면 posterior가 트랙별로 일관되게 누적됩니다.
