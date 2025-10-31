@@ -2,6 +2,7 @@
 
 import time
 import numpy as np
+import math
 
 #낙상 판단에 필요한 모든 로직과 상태 추적을 담당하는 클래스
 class FallDetectorLogic:
@@ -11,6 +12,67 @@ class FallDetectorLogic:
         self.ASPECT_RATIO_THRESHOLD = 1.0 #낙상으로 판단할 가로/세로 비율 임계값 설정 (x변화량/y변화량) 
         self.STILLNESS_TIME_THRESHOLD = 3 #낙상 후 움직임이 없어야 하는 최소 시간 설정 
         self.STILLNESS_Y_THRESHOLD = 5 #움직임 없음으로 판단할 픽셀 변화 임계값
+
+        # 베이즈 추론(로그-오즈 누적) 관련 파라미터
+        # 사전확률: 낙상은 드뭄 (약 1%)
+        self.DEFAULT_LOG_ODDS = math.log(0.01 / (1 - 0.01))
+        # 프레임 간 연속성 편향(아주 약하게 상승시키거나 1.0으로 비활성화 가능)
+        self.TRANSITION_BIAS = math.log(1.02)
+        # 의사결정 임계값 (히스테리시스 적용)
+        self.FALL_THRESHOLD = 0.9
+        self.RECOVER_THRESHOLD = 0.7
+
+        # 특징 분포(간단한 가우시안/베르누이 근사) - 데이터에 맞게 튜닝 필요
+        self.VEL_FALL_MU = 250
+        self.VEL_FALL_SIG = 80
+        self.VEL_NOT_MU = 30
+        self.VEL_NOT_SIG = 40
+
+        self.AR_FALL_MU = 1.6
+        self.AR_FALL_SIG = 0.4
+        self.AR_NOT_MU = 0.6
+        self.AR_NOT_SIG = 0.3
+
+        # 정지 여부에 대한 라플라스 스무딩된 베르누이 확률
+        self.STILL_P_FALL = (0.9, 0.1) # (still, not-still)에서 p(still|Fall), p(not|Fall)
+        self.STILL_P_NOT  = (0.2, 0.8) # (still, not-still)에서 p(still|¬Fall), p(not|¬Fall)
+
+    def _sigmoid(self, x):
+        return 1.0 / (1.0 + math.exp(-x))
+
+    def _gaussian_log_likelihood(self, x, mu, sigma):
+        if sigma <= 0:
+            return -1e9
+        z = (x - mu) / sigma
+        return -0.5 * (z * z)
+
+    def _feature_llr_velocity(self, velocity_y):
+        ll_fall = self._gaussian_log_likelihood(velocity_y, self.VEL_FALL_MU, self.VEL_FALL_SIG)
+        ll_not  = self._gaussian_log_likelihood(velocity_y, self.VEL_NOT_MU, self.VEL_NOT_SIG)
+        return ll_fall - ll_not
+
+    def _feature_llr_aspect(self, aspect_ratio):
+        ll_fall = self._gaussian_log_likelihood(aspect_ratio, self.AR_FALL_MU, self.AR_FALL_SIG)
+        ll_not  = self._gaussian_log_likelihood(aspect_ratio, self.AR_NOT_MU, self.AR_NOT_SIG)
+        return ll_fall - ll_not
+
+    def _feature_llr_still(self, is_still):
+        if is_still:
+            p_fall, p_not = self.STILL_P_FALL[0], self.STILL_P_NOT[0]
+        else:
+            p_fall, p_not = self.STILL_P_FALL[1], self.STILL_P_NOT[1]
+        return math.log(p_fall + 1e-6) - math.log(p_not + 1e-6)
+
+    def _update_posterior(self, state, velocity_y, aspect_ratio, is_still):
+        log_odds = state.get('log_odds_fall', self.DEFAULT_LOG_ODDS)
+        log_odds += self._feature_llr_velocity(velocity_y)
+        log_odds += self._feature_llr_aspect(aspect_ratio)
+        log_odds += self._feature_llr_still(is_still)
+        log_odds += self.TRANSITION_BIAS
+        # 수치 안정화 클리핑
+        log_odds = max(min(log_odds, 20.0), -20.0)
+        state['log_odds_fall'] = log_odds
+        return self._sigmoid(log_odds)
 
     #매 프레임마다 YOLO 감지 결과(detection)를 처리하고 낙상 지표를 계산하는 메서드
     def process_detection(self, track_id, bbox, current_time):
@@ -25,7 +87,8 @@ class FallDetectorLogic:
                 'last_y': current_center_y,
                 'last_time': current_time,
                 'status': 'Standing',
-                'fall_start_time': None
+                'fall_start_time': None,
+                'log_odds_fall': self.DEFAULT_LOG_ODDS
             }
             return self.person_states[track_id]['status'] #초기 상태일 때는 계산을 건너뛰고 기본 상태를 반환 
         
@@ -38,13 +101,9 @@ class FallDetectorLogic:
 
         aspect_ratio = width / height if height > 0 else 0
 
-        # 1. Y축 속도를 이용한 급격한 하강 감지
+        # 규칙 기반 보조 특징 (베이즈 우도에 사용)
         is_high_velocity_fall = velocity_y > self.VELOCITY_THRESHOLD
-
-        # 2. 바운딩 박스 비율을 이용한 쓰러짐 감지 (x변화량/y변화량 > 1.0)
         is_horizontal = aspect_ratio > self.ASPECT_RATIO_THRESHOLD
-
-        # 현재 정지 상태인지 확인 
         is_currently_still = abs(dy) < self.STILLNESS_Y_THRESHOLD
 
         # -----------------------------------------------------------------
@@ -54,41 +113,38 @@ class FallDetectorLogic:
         current_status = state['status']
         fall_start_time = state['fall_start_time']
 
-        # 1. 초기 낙상 감지: 속도가 빠르거나, 현재 Potential Fall 상태가 아니라면
-        if is_high_velocity_fall and current_status not in ['Potential Fall', 'Fall Detected!']:
-            current_status = 'Potential Fall'
-            fall_start_time = current_time  # 타이머 시작
-        
-        # 2. Potential Fall 상태 처리
-        if current_status == 'Potential Fall':
-            
-            # 누워있는 상태(is_horizontal)가 지속되어야 최종 판단 진행
-            if is_horizontal:
-                # 정지 상태가 충분한 시간(3초) 이상 지속되었는지 확인
-                if is_currently_still and (current_time - fall_start_time) >= self.STILLNESS_TIME_THRESHOLD:
-                    current_status = 'Fall Detected!' # 최종 낙상 사고 확정
-                    fall_start_time = None # 타이머 초기화 (더 이상 필요 없음)
-                # 정지 상태가 아니라면 타이머는 계속 흐르거나, 리셋될 수 있음 (단순히 이탈 방지)
-                # 여기서는 타이머가 흐르도록 유지
-            else:
-                # 속도는 빨랐지만 다시 서거나 앉은 자세로 돌아간 경우 (오경보)
-                current_status = 'Standing'
-                fall_start_time = None # 타이머 리셋
+        # 베이즈 posterior 업데이트
+        p_fall = self._update_posterior(state, velocity_y, aspect_ratio, is_currently_still)
 
-        # 3. 일반 상태 (낙상이 아닌 경우)
-        elif current_status not in ['Potential Fall', 'Fall Detected!']:
-            if is_horizontal:
-                current_status = 'Lying'  # 단순히 누워있는 자세
-            elif current_center_y < (state['last_y'] - 50) and abs(velocity_y) < 5:
-                current_status = 'Sitting' # 앉은 자세
+        # 히스테리시스 기반 상태 결정
+        if current_status != 'Fall Detected!':
+            if p_fall >= self.FALL_THRESHOLD:
+                current_status = 'Fall Detected!'
+                fall_start_time = None
             else:
-                current_status = 'Standing'
-            fall_start_time = None # 타이머 리셋
-
-        # 4. Fall Detected! 상태에서는 계속 유지
-        elif current_status == 'Fall Detected!':
-             # 사고가 확정되었으므로 상태를 유지 (알림 후 수동 리셋 필요)
-            pass 
+                # 보조 상태 레이블링 (설명/시각화를 위해 유지)
+                if is_horizontal:
+                    current_status = 'Lying'
+                elif current_center_y < (state['last_y'] - 50) and abs(velocity_y) < 5:
+                    current_status = 'Sitting'
+                elif is_high_velocity_fall:
+                    current_status = 'Potential Fall'
+                else:
+                    current_status = 'Standing'
+                # Potential Fall 시점 기록은 선택적
+                if current_status == 'Potential Fall' and fall_start_time is None:
+                    fall_start_time = current_time
+                elif current_status != 'Potential Fall':
+                    fall_start_time = None
+        else:
+            # 이미 Fall 상태인 경우 복구 임계값 아래로 충분히 내려가면 해제
+            if p_fall < self.RECOVER_THRESHOLD:
+                # 해제 후 현재 자세에 따라 라벨
+                if is_horizontal:
+                    current_status = 'Lying'
+                else:
+                    current_status = 'Standing'
+                fall_start_time = None
         
         #상태 정보 업데이트
         state['last_y'] = current_center_y
